@@ -1,70 +1,129 @@
 #!/usr/bin/env python3
-"""
-AI Nmap Scanner cho Termux - Tự động quét với lệnh do AI đề xuất.
-Yêu cầu: Nmap, Python, OpenAI API key.
-Chỉ quét hệ thống bạn có quyền!
-"""
+# -*- coding: utf-8 -*-
 
-import json
-import os
-import re
-import subprocess
-import sys
-import time
+import os, sys, json, re, time, subprocess, sqlite3, textwrap
 from datetime import datetime
-from typing import List, Dict, Optional
+from typing import Dict, List, Optional
 from urllib.parse import urlparse
 
-# Thư viện bên ngoài
-try:
+# ===================== XỬ LÝ IMPORT ĐỘNG =====================
+MISSING_MODULES = []
+
+def safe_import(module_name, pip_name=None):
+    try:
+        return __import__(module_name)
+    except ImportError:
+        MISSING_MODULES.append(pip_name or module_name)
+        return None
+
+colorama = safe_import("colorama", "colorama")
+if colorama:
     from colorama import Fore, Style, init
     init(autoreset=True)
-except ImportError:
-    print("Thiếu colorama. Cài: pip install colorama")
-    sys.exit(1)
+else:
+    class Fore: RED=GREEN=YELLOW=BLUE=CYAN=MAGENTA=WHITE=RESET=""
+    class Style: BRIGHT=RESET_ALL=""
 
-try:
+dotenv = safe_import("dotenv", "python-dotenv")
+if dotenv:
     from dotenv import load_dotenv
     load_dotenv()
-except ImportError:
-    print("Thiếu python-dotenv. Cài: pip install python-dotenv")
-    sys.exit(1)
+else:
+    def load_dotenv(): pass
 
+openai_mod = safe_import("openai", "openai")
+nmap_mod = safe_import("nmap", "python-nmap")
+cryptography_fernet = safe_import("cryptography.fernet", "cryptography")
+if cryptography_fernet:
+    from cryptography.fernet import Fernet
+else:
+    Fernet = None
+
+requests_mod = safe_import("requests", "requests")  # Dùng cho Telegram
+
+# Reportlab chỉ dùng nếu xuất PDF
+reportlab = None
 try:
-    from openai import OpenAI
+    from reportlab.lib.pagesizes import A4
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Preformatted
+    from reportlab.lib.styles import getSampleStyleSheet
+    from reportlab.lib.units import inch
+    reportlab = True
 except ImportError:
-    print("Thiếu openai. Cài: pip install openai")
-    sys.exit(1)
+    reportlab = False
 
-# ========== CẤU HÌNH ==========
-CONFIG_FILE = os.path.expanduser("~/.ai_nmap_config.json")
-HISTORY_FILE = os.path.expanduser("~/.ai_nmap_history.json")
-VERSION = "2.1.0"
-GITHUB_VERSION_URL = "https://raw.githubusercontent.com/yourname/ai-nmap-termux/main/version.txt"  # Đổi thành URL thật
+if MISSING_MODULES:
+    print(Fore.RED + "Thiếu các gói sau, cài bằng lệnh:")
+    print("pip install " + " ".join(MISSING_MODULES))
+    print("Sau đó chạy lại (nếu không cần Telegram, có thể bỏ qua requests).")
+    # Không thoát, vì requests có thể không bắt buộc nếu không dùng Telegram
+    # Chỉ cảnh báo
+    # sys.exit(1)  # Bỏ comment nếu muốn bắt buộc
 
-# ========== QUẢN LÝ CẤU HÌNH ==========
-class ConfigManager:
-    def __init__(self, config_path=CONFIG_FILE):
-        self.config_path = config_path
+# ===================== CẤU HÌNH FILE =====================
+CONFIG_FILE = os.path.expanduser("~/.ai_nmap_pro_config.json")
+KEY_FILE = os.path.expanduser("~/.ai_nmap_pro_key.key")
+DB_PATH = os.path.expanduser("~/.ai_nmap_scans.db")
+VERSION = "3.1.0"
+GITHUB_VERSION_URL = "https://raw.githubusercontent.com/yourusername/ai_nmap_pro/main/version.json"
+
+# ===================== QUẢN LÝ KEY / MÃ HOÁ =====================
+def generate_key():
+    if Fernet:
+        key = Fernet.generate_key()
+        with open(KEY_FILE, "wb") as f:
+            f.write(key)
+        return key
+    return None
+
+def load_key():
+    if not Fernet:
+        return None
+    if os.path.exists(KEY_FILE):
+        with open(KEY_FILE, "rb") as f:
+            return f.read()
+    return generate_key()
+
+def encrypt(data: str) -> str:
+    if not Fernet:
+        return data
+    f = Fernet(load_key())
+    return f.encrypt(data.encode()).decode()
+
+def decrypt(token: str) -> str:
+    if not Fernet:
+        return token
+    f = Fernet(load_key())
+    return f.decrypt(token.encode()).decode()
+
+# ===================== CONFIG =====================
+class Config:
+    def __init__(self, path=CONFIG_FILE):
+        self.path = path
         self.defaults = {
             "output_dir": os.path.expanduser("~/nmap_scans"),
             "timeout": 300,
             "model": "gpt-3.5-turbo",
-            "num_commands": 4
+            "num_commands": 4,
+            "api_key_enc": "",
+            "schedule_enabled": False,
+            "schedule_interval_hours": 24,
+            "schedule_targets": [],
+            "telegram_bot_token_enc": "",
+            "telegram_chat_id": "",
+            "telegram_enabled": False
         }
         self.data = self.load()
 
-    def load(self) -> dict:
-        if os.path.exists(self.config_path):
-            try:
-                with open(self.config_path, 'r') as f:
-                    return {**self.defaults, **json.load(f)}
-            except:
-                pass
+    def load(self):
+        if os.path.exists(self.path):
+            with open(self.path, "r") as f:
+                user = json.load(f)
+                return {**self.defaults, **user}
         return self.defaults.copy()
 
     def save(self):
-        with open(self.config_path, 'w') as f:
+        with open(self.path, "w") as f:
             json.dump(self.data, f, indent=2)
 
     def get(self, key):
@@ -75,350 +134,412 @@ class ConfigManager:
         self.save()
 
     def get_api_key(self):
-        # Ưu tiên biến môi trường
-        key = os.getenv("OPENAI_API_KEY")
-        if key:
-            return key
-        # Sau đó đọc từ config
-        return self.data.get("api_key")
+        env_key = os.getenv("OPENAI_API_KEY")
+        if env_key:
+            return env_key
+        enc = self.data.get("api_key_enc")
+        if enc:
+            return decrypt(enc)
+        return ""
 
     def set_api_key(self, key):
-        self.data["api_key"] = key
+        self.data["api_key_enc"] = encrypt(key)
         self.save()
-        # Cũng ghi vào .env nếu muốn
-        env_path = os.path.expanduser("~/.ai_nmap.env")
-        with open(env_path, "w") as f:
-            f.write(f"OPENAI_API_KEY={key}\n")
-        print(Fore.GREEN + "API key đã được lưu vào config và ~/.ai_nmap.env")
 
-# ========== QUẢN LÝ LỊCH SỬ ==========
-class HistoryManager:
-    def __init__(self, history_path=HISTORY_FILE):
-        self.history_path = history_path
-        self.entries = self.load()
+    def get_telegram_token(self):
+        enc = self.data.get("telegram_bot_token_enc")
+        if enc:
+            return decrypt(enc)
+        return ""
 
-    def load(self) -> list:
-        if os.path.exists(self.history_path):
-            try:
-                with open(self.history_path, 'r') as f:
-                    return json.load(f)
-            except:
-                pass
-        return []
+    def set_telegram_token(self, token):
+        self.data["telegram_bot_token_enc"] = encrypt(token)
+        self.save()
 
-    def save(self):
-        with open(self.history_path, 'w') as f:
-            json.dump(self.entries, f, indent=2)
+# ===================== DATABASE =====================
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS scans
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  target TEXT NOT NULL,
+                  timestamp TEXT NOT NULL,
+                  commands TEXT NOT NULL,
+                  results_json TEXT,
+                  report_files TEXT)''')
+    conn.commit()
+    conn.close()
 
-    def add(self, target: str, commands: List[str], results: Dict[str, str], output_files: Dict[str, str]):
-        entry = {
-            "id": len(self.entries) + 1,
-            "timestamp": datetime.now().isoformat(),
-            "target": target,
-            "commands": commands,
-            "results_summary": {cmd: out[:200] + "..." if len(out)>200 else out for cmd, out in results.items()},
-            "output_files": output_files
+def add_scan(target, commands, results_dict, report_files):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("INSERT INTO scans (target, timestamp, commands, results_json, report_files) VALUES (?, ?, ?, ?, ?)",
+              (target, datetime.now().isoformat(), json.dumps(commands), json.dumps(results_dict), json.dumps(report_files)))
+    conn.commit()
+    scan_id = c.lastrowid
+    conn.close()
+    return scan_id
+
+def get_all_scans():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT id, target, timestamp FROM scans ORDER BY id DESC LIMIT 50")
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+def get_scan_by_id(scan_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT * FROM scans WHERE id=?", (scan_id,))
+    row = c.fetchone()
+    conn.close()
+    if row:
+        return {
+            "id": row[0], "target": row[1], "timestamp": row[2],
+            "commands": json.loads(row[3]), "results": json.loads(row[4]),
+            "report_files": json.loads(row[5])
         }
-        self.entries.append(entry)
-        self.save()
+    return None
 
-    def list_all(self):
-        return self.entries
+def delete_scan(scan_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("DELETE FROM scans WHERE id=?", (scan_id,))
+    conn.commit()
+    conn.close()
 
-    def get_by_id(self, id: int) -> Optional[dict]:
-        for e in self.entries:
-            if e["id"] == id:
-                return e
-        return None
-
-# ========== TIỆN ÍCH ==========
-def is_valid_host(host: str) -> bool:
-    ip_pattern = r"^(\d{1,3}\.){3}\d{1,3}$"
-    if re.match(ip_pattern, host):
-        return all(0 <= int(p) <= 255 for p in host.split('.'))
-    domain_pattern = r"^(?:[a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}$"
-    return re.match(domain_pattern, host) is not None
-
-def extract_host(url: str) -> str:
-    url = url.strip()
-    if not url.startswith(("http://", "https://")):
-        url = "http://" + url
-    parsed = urlparse(url)
-    host = parsed.hostname
-    if not host:
-        raise ValueError("Không thể trích xuất host từ URL.")
-    return host
-
-def check_nmap() -> bool:
-    try:
-        subprocess.run(["nmap", "--version"], capture_output=True, check=True)
-        return True
-    except:
-        return False
-
-# ========== AI ADVISOR ==========
+# ===================== AI ADVISOR =====================
 class AINmapAdvisor:
-    def __init__(self, api_key: str, model="gpt-3.5-turbo"):
-        self.client = OpenAI(api_key=api_key)
+    def __init__(self, api_key, model="gpt-3.5-turbo"):
+        self.client = openai_mod.OpenAI(api_key=api_key)
         self.model = model
+        self.cache = {}
 
-    def suggest_commands(self, target: str, hint: str = "", num: int = 4) -> List[str]:
+    def suggest_commands(self, target, hint="", num=4):
+        cache_key = f"{target}|{hint}"
+        if cache_key in self.cache:
+            return self.cache[cache_key]
         prompt = f"""You are a cybersecurity expert. Suggest {num} useful nmap commands to scan target: {target}.
 User hint: "{hint}"
-Return only the commands, one per line, each starting with 'nmap '.
-Use flags like -sV, -sC, -p-, -sU, --script, -O, -A, -T4... but be realistic.
-"""
+Return only commands, one per line, each starting with 'nmap '.
+Use realistic flags like -sV, -sC, -p-, -sU, --script, -O, -A, -T4."""
         for attempt in range(3):
             try:
                 resp = self.client.chat.completions.create(
                     model=self.model,
-                    messages=[{"role": "user", "content": prompt}],
+                    messages=[{"role":"user","content":prompt}],
                     temperature=0.3,
                     max_tokens=300
                 )
                 content = resp.choices[0].message.content.strip()
                 cmds = [line.strip() for line in content.split('\n') if line.strip().startswith('nmap ')]
                 if cmds:
+                    self.cache[cache_key] = cmds[:num]
                     return cmds[:num]
             except Exception as e:
-                print(Fore.YELLOW + f"OpenAI thử {attempt+1} lỗi: {e}")
-        # Fallback
-        return [
+                print(Fore.YELLOW + f"AI attempt {attempt+1} failed: {e}")
+        # fallback
+        fb = [
             f"nmap -sV -sC -T4 {target}",
             f"nmap -p- --min-rate=1000 -T4 {target}",
             f"nmap -sU --top-ports 100 -T4 {target}"
         ]
+        self.cache[cache_key] = fb
+        return fb
 
-# ========== NMAP RUNNER ==========
-class NmapRunner:
+# ===================== NMAP SCANNER =====================
+class NmapScanner:
     def __init__(self, timeout=300):
         self.timeout = timeout
         self.results = {}
 
-    def run_command(self, command: str) -> str:
+    def run_command(self, command):
         if not command.startswith("nmap "):
-            return f"[!] Lệnh không hợp lệ: {command}"
+            return {"error": "Invalid command"}
         args = command.split()[1:]
-        print(Fore.CYAN + f"Đang chạy: {command}")
+        print(Fore.CYAN + f"Running: {command}")
         try:
-            proc = subprocess.run(
-                ["nmap"] + args,
-                capture_output=True,
-                text=True,
-                timeout=self.timeout
-            )
-            return proc.stdout + ("\n[STDERR]\n" + proc.stderr if proc.stderr else "")
+            proc = subprocess.run(["nmap"] + args + ["-oX", "-"],
+                                  capture_output=True, text=True, timeout=self.timeout)
+            xml_output = proc.stdout
+            if proc.stderr:
+                xml_output += "\n<!-- stderr: " + proc.stderr + " -->"
+            nm = nmap_mod.PortScanner()
+            nm.analyse_nmap_xml_scan(xml_output)
+            parsed = self._parse_nmap(nm)
+            parsed['raw_xml'] = xml_output
+            return parsed
         except subprocess.TimeoutExpired:
-            return f"[!] Hết thời gian ({self.timeout}s)"
+            return {"error": "Timeout"}
         except Exception as e:
-            return f"[!] Lỗi: {e}"
+            return {"error": str(e)}
 
-    def run_commands(self, commands: List[str]) -> Dict[str, str]:
+    def _parse_nmap(self, nm):
+        data = {"hosts": {}}
+        for host in nm.all_hosts():
+            info = {
+                "hostname": nm[host].hostname(),
+                "state": nm[host].state(),
+                "tcp": {}, "udp": {},
+                "os": nm[host].get('os', {}),
+                "script": nm[host].get('script', {})
+            }
+            for proto in nm[host].all_protocols():
+                ports = nm[host][proto]
+                for port in ports:
+                    p_data = {
+                        "state": ports[port]['state'],
+                        "service": ports[port]['name'],
+                        "product": ports[port].get('product', ''),
+                        "version": ports[port].get('version', ''),
+                        "extrainfo": ports[port].get('extrainfo', '')
+                    }
+                    info[proto][port] = p_data
+            data["hosts"][host] = info
+        return data
+
+    def run_commands(self, commands):
         for cmd in commands:
             self.results[cmd] = self.run_command(cmd)
             time.sleep(1)
         return self.results
 
-    def save_reports(self, target: str, output_dir: str, formats: List[str] = None) -> Dict[str, str]:
-        if not formats:
-            formats = ["txt", "json"]
+# ===================== REPORTER =====================
+class ReportGenerator:
+    def __init__(self, output_dir):
+        self.output_dir = output_dir
+
+    def generate(self, target, results, formats=["txt","json","html"]):
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        safe_target = re.sub(r'[^a-zA-Z0-9.-]', '_', target)
+        safe_target = re.sub(r'[^a-zA-Z0-9.\-]', '_', target)
         base = f"nmap_{safe_target}_{ts}"
-        os.makedirs(output_dir, exist_ok=True)
+        os.makedirs(self.output_dir, exist_ok=True)
         saved = {}
-        data = {
-            "target": target,
-            "scan_time": ts,
-            "commands": [{"cmd": c, "output": o} for c, o in self.results.items()]
-        }
-
         if "txt" in formats:
-            path = os.path.join(output_dir, f"{base}.txt")
-            with open(path, 'w') as f:
-                f.write(f"AI Nmap Report for {target}\n{ts}\n{'='*60}\n\n")
-                for item in data["commands"]:
-                    f.write(f"> {item['cmd']}\n{item['output']}\n{'-'*60}\n")
-            saved["txt"] = path
-
+            saved["txt"] = self._txt(target, results, base)
         if "json" in formats:
-            path = os.path.join(output_dir, f"{base}.json")
-            with open(path, 'w') as f:
-                json.dump(data, f, indent=2)
-            saved["json"] = path
-
-        if "xml" in formats:
-            path = os.path.join(output_dir, f"{base}.xml")
-            with open(path, 'w') as f:
-                f.write('<?xml version="1.0"?>\n<nmap_scan>\n')
-                f.write(f'<target>{target}</target>\n<time>{ts}</time>\n')
-                for item in data["commands"]:
-                    f.write(f'<command cmd="{item["cmd"]}"><![CDATA[{item["output"]}]]></command>\n')
-                f.write('</nmap_scan>')
-            saved["xml"] = path
-
+            saved["json"] = self._json(target, results, base)
         if "html" in formats:
-            path = os.path.join(output_dir, f"{base}.html")
-            html = f"<html><head><meta charset='UTF-8'><title>Scan {target}</title></head><body><h1>{target}</h1><p>{ts}</p>"
-            for item in data["commands"]:
-                html += f"<h3>{item['cmd']}</h3><pre>{item['output']}</pre><hr>"
-            html += "</body></html>"
-            with open(path, 'w') as f:
-                f.write(html)
-            saved["html"] = path
-
+            saved["html"] = self._html(target, results, base)
+        if "pdf" in formats and reportlab:
+            saved["pdf"] = self._pdf(target, results, base)
         return saved
 
-# ========== MENU CHÍNH ==========
-def print_banner():
-    print(Fore.MAGENTA + Style.BRIGHT + """
-   ╔══════════════════════════════════════╗
-   ║     🧠 AI NMAP SCANNER TERMUX     ║
-   ║        version """ + VERSION + """               ║
-   ╚══════════════════════════════════════╝
-    """ + Style.RESET_ALL)
+    def _txt(self, target, results, base):
+        path = os.path.join(self.output_dir, f"{base}.txt")
+        with open(path, 'w') as f:
+            f.write(f"AI Nmap Scan Report for {target}\n{datetime.now().isoformat()}\n\n")
+            for cmd, data in results.items():
+                f.write(f"> {cmd}\n")
+                if 'raw_xml' in data:
+                    f.write(data['raw_xml'])
+                else:
+                    f.write(json.dumps(data, indent=2))
+                f.write("\n" + "-"*60 + "\n")
+        return path
 
-def show_menu():
-    print(Fore.YELLOW + "\n===== MENU CHÍNH =====")
-    print("1. 🚀 Quét mục tiêu mới")
-    print("2. 📋 Xem lịch sử quét")
-    print("3. ⚙️  Cấu hình (API key, thư mục...)")
-    print("4. 🔄 Kiểm tra cập nhật")
-    print("5. ❌ Thoát")
-    return input(Fore.CYAN + "Chọn (1-5): ").strip()
+    def _json(self, target, results, base):
+        path = os.path.join(self.output_dir, f"{base}.json")
+        with open(path, 'w') as f:
+            json.dump({"target":target,"scan_time":datetime.now().isoformat(),"commands":{cmd:data for cmd,data in results.items()}}, f, indent=2)
+        return path
 
-def scan_target(config: ConfigManager, history: HistoryManager):
+    def _html(self, target, results, base):
+        path = os.path.join(self.output_dir, f"{base}.html")
+        html = f"<html><head><meta charset='UTF-8'><title>Scan {target}</title></head><body><h1>{target}</h1>"
+        for cmd, data in results.items():
+            html += f"<h2>{cmd}</h2><pre>{json.dumps(data, indent=2)}</pre><hr>"
+        html += "</body></html>"
+        with open(path, 'w') as f:
+            f.write(html)
+        return path
+
+    def _pdf(self, target, results, base):
+        if not reportlab:
+            return None
+        path = os.path.join(self.output_dir, f"{base}.pdf")
+        doc = SimpleDocTemplate(path, pagesize=A4)
+        styles = getSampleStyleSheet()
+        story = [Paragraph(f"AI Nmap Report for {target}", styles['Title']), Spacer(1, 0.2*inch)]
+        for cmd, data in results.items():
+            story.append(Paragraph(f"Command: {cmd}", styles['Heading2']))
+            text = data.get('raw_xml', json.dumps(data, indent=2))
+            story.append(Preformatted(text, styles['Code'], max_line_length=80))
+            story.append(Spacer(1, 0.1*inch))
+        doc.build(story)
+        return path
+
+# ===================== TELEGRAM SENDER =====================
+class TelegramSender:
+    def __init__(self, bot_token, chat_id):
+        self.bot_token = bot_token
+        self.chat_id = chat_id
+        self.api_url = f"https://api.telegram.org/bot{bot_token}"
+
+    def _check_requests(self):
+        if not requests_mod:
+            print(Fore.RED + "Thiếu thư viện 'requests'. Cài: pip install requests")
+            return False
+        return True
+
+    def send_message(self, text):
+        if not self._check_requests():
+            return False
+        try:
+            url = f"{self.api_url}/sendMessage"
+            payload = {"chat_id": self.chat_id, "text": text, "parse_mode": "Markdown"}
+            r = requests_mod.post(url, json=payload, timeout=15)
+            return r.json().get("ok", False)
+        except Exception as e:
+            print(Fore.RED + f"Lỗi gửi Telegram: {e}")
+            return False
+
+    def send_file(self, file_path, caption=None):
+        if not self._check_requests():
+            return False
+        try:
+            url = f"{self.api_url}/sendDocument"
+            with open(file_path, 'rb') as f:
+                files = {"document": f}
+                data = {"chat_id": self.chat_id}
+                if caption:
+                    data["caption"] = caption
+                r = requests_mod.post(url, data=data, files=files, timeout=30)
+                return r.json().get("ok", False)
+        except Exception as e:
+            print(Fore.RED + f"Lỗi gửi file Telegram: {e}")
+            return False
+
+    def send_scan_result(self, target, saved_files, short_summary=True):
+        """Gửi tóm tắt text trước, sau đó gửi file báo cáo TXT hoặc HTML."""
+        # Gửi message tóm tắt
+        msg = f"✅ *Quét hoàn tất cho {target}*\n"
+        if short_summary:
+            msg += "📄 Báo cáo được đính kèm bên dưới."
+        self.send_message(msg)
+
+        # Gửi file txt nếu có (nhỏ gọn), nếu không thì html
+        preferred = saved_files.get("txt") or saved_files.get("html") or next(iter(saved_files.values()))
+        if preferred and os.path.exists(preferred):
+            self.send_file(preferred, caption=f"Báo cáo {target}")
+
+# ===================== TIỆN ÍCH =====================
+def is_valid_host(host):
+    if re.match(r"^(\d{1,3}\.){3}\d{1,3}$", host):
+        return all(0<=int(p)<=255 for p in host.split('.'))
+    return re.match(r"^(?:[a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}$", host) is not None
+
+def extract_host(url):
+    url = url.strip()
+    if not url.startswith(('http://','https://')):
+        url = 'http://' + url
+    return urlparse(url).hostname
+
+def check_nmap():
+    try:
+        subprocess.run(["nmap","--version"], capture_output=True, check=True)
+        return True
+    except:
+        return False
+
+# ===================== MENU CLI =====================
+def banner():
+    print(Fore.MAGENTA + Style.BRIGHT + f"""
+   ╔════════════════════════════════════════╗
+   ║     🧠 AI Nmap Scanner Pro v{VERSION}    ║
+   ║        Termux + Telegram Edition       ║
+   ╚════════════════════════════════════════╝
+    """)
+
+def main_menu(config):
+    init_db()
+    while True:
+        banner()
+        print(Fore.YELLOW + "[1] Quét mục tiêu mới")
+        print("[2] Quét danh sách từ file")
+        print("[3] Xem lịch sử quét")
+        print("[4] Cấu hình")
+        print("[5] Lập lịch quét tự động")
+        print("[6] Kiểm tra cập nhật")
+        print("[7] Thoát")
+        choice = input(Fore.CYAN + "Chọn: ").strip()
+
+        if choice == '1':
+            scan_single(config)
+        elif choice == '2':
+            scan_from_file(config)
+        elif choice == '3':
+            history_menu()
+        elif choice == '4':
+            config_menu(config)
+        elif choice == '5':
+            schedule_menu(config)
+        elif choice == '6':
+            check_update()
+        elif choice == '7':
+            print(Fore.GREEN + "Tạm biệt!")
+            break
+        else:
+            print(Fore.RED + "Lựa chọn không hợp lệ.")
+
+def scan_single(config, silent_telegram=False):
     api_key = config.get_api_key()
     if not api_key:
-        print(Fore.RED + "Bạn chưa có API key. Hãy cấu hình trong menu Cấu hình.")
+        print(Fore.RED + "Chưa có OpenAI API Key. Vào mục Cấu hình để nhập.")
         return
-    url = input("Nhập URL hoặc IP: ").strip()
+    url = input("URL hoặc IP: ").strip()
     try:
         host = extract_host(url) if not is_valid_host(url) else url
     except:
-        print(Fore.RED + "URL không hợp lệ.")
-        return
-    hint = input("Mô tả thêm cho AI (Enter nếu không): ").strip()
+        print("URL không hợp lệ."); return
+    hint = input("Gợi ý cho AI (Enter để bỏ qua): ").strip()
     advisor = AINmapAdvisor(api_key, config.get("model"))
-    print(Fore.BLUE + "AI đang đề xuất lệnh...")
     cmds = advisor.suggest_commands(host, hint, config.get("num_commands"))
-    print(Fore.MAGENTA + "\n--- Các lệnh đề xuất ---")
-    for i, c in enumerate(cmds, 1):
-        print(f"{i}. {c}")
-    yn = input(Fore.YELLOW + "Chạy các lệnh này? (y/n): ").lower()
-    if yn != 'y':
-        return
-    runner = NmapRunner(timeout=config.get("timeout"))
-    results = runner.run_commands(cmds)
-    output_dir = config.get("output_dir")
-    formats = ["txt", "json"]  # có thể cho tùy chọn sau
-    saved = runner.save_reports(host, output_dir, formats)
-    print(Fore.GREEN + "\nĐã lưu báo cáo:")
-    for fmt, path in saved.items():
-        print(f"  [{fmt}] {path}")
-    history.add(host, cmds, results, saved)
-    print(Fore.GREEN + "Đã ghi vào lịch sử.")
+    print(Fore.MAGENTA + "\nĐề xuất lệnh:")
+    for i,c in enumerate(cmds,1): print(f"  {i}. {c}")
+    if input("Chạy những lệnh này? (y/n): ").lower() != 'y': return
+    scanner = NmapScanner(config.get("timeout"))
+    results = scanner.run_commands(cmds)
+    reporter = ReportGenerator(config.get("output_dir"))
+    saved = reporter.generate(host, results, ["txt","json","html","pdf"] if reportlab else ["txt","json","html"])
+    add_scan(host, cmds, results, saved)
+    print(Fore.GREEN + "\nBáo cáo đã lưu:")
+    for fmt, path in saved.items(): print(f"  [{fmt}] {path}")
 
-def view_history(history: HistoryManager):
-    entries = history.list_all()
-    if not entries:
-        print(Fore.YELLOW + "Chưa có lịch sử quét.")
-        return
-    print(Fore.CYAN + "\n===== LỊCH SỬ QUÉT =====")
-    for e in entries:
-        print(f"[{e['id']}] {e['target']} - {e['timestamp']}")
-    choice = input("Nhập ID để xem chi tiết (Enter để về): ").strip()
-    if choice.isdigit():
-        e = history.get_by_id(int(choice))
-        if e:
-            print(Fore.MAGENTA + f"\nTarget: {e['target']}")
-            print(f"Thời gian: {e['timestamp']}")
-            print("Các lệnh đã chạy:")
-            for c in e['commands']:
-                print(f"  - {c}")
-            print("Kết quả tóm tắt:")
-            for cmd, out in e['results_summary'].items():
-                print(f"  {cmd}:\n    {out}")
-            print("File báo cáo:", e.get('output_files'))
+    # Gửi Telegram nếu được kích hoạt
+    if config.get("telegram_enabled") and not silent_telegram:
+        token = config.get_telegram_token()
+        chat_id = config.get("telegram_chat_id")
+        if token and chat_id:
+            choice = input(Fore.CYAN + "Gửi báo cáo qua Telegram? (y/n): ").lower()
+            if choice == 'y':
+                sender = TelegramSender(token, chat_id)
+                sender.send_scan_result(host, saved)
         else:
-            print("ID không tồn tại.")
+            print(Fore.YELLOW + "Telegram chưa được cấu hình đầy đủ.")
+    elif silent_telegram and config.get("telegram_enabled"):
+        token = config.get_telegram_token()
+        chat_id = config.get("telegram_chat_id")
+        if token and chat_id:
+            sender = TelegramSender(token, chat_id)
+            sender.send_scan_result(host, saved)
 
-def configure(config: ConfigManager):
-    while True:
-        print(Fore.CYAN + "\n--- Cấu hình ---")
-        print(f"1. API Key (hiện: {'****' if config.get_api_key() else 'Chưa có'})")
-        print(f"2. Thư mục lưu báo cáo (hiện: {config.get('output_dir')})")
-        print(f"3. Timeout mỗi lệnh (giây, hiện: {config.get('timeout')})")
-        print(f"4. Model AI (hiện: {config.get('model')})")
-        print(f"5. Số lệnh AI đề xuất (hiện: {config.get('num_commands')})")
-        print("6. Quay lại")
-        c = input("Chọn: ").strip()
-        if c == '1':
-            key = input("Nhập OpenAI API key: ").strip()
-            if key:
-                config.set_api_key(key)
-        elif c == '2':
-            d = input("Đường dẫn thư mục: ").strip()
-            if d:
-                config.set("output_dir", d)
-        elif c == '3':
-            t = input("Timeout (giây): ").strip()
-            if t.isdigit():
-                config.set("timeout", int(t))
-        elif c == '4':
-            m = input("Model (vd: gpt-3.5-turbo, gpt-4): ").strip()
-            if m:
-                config.set("model", m)
-        elif c == '5':
-            n = input("Số lệnh (2-6): ").strip()
-            if n.isdigit() and 2 <= int(n) <= 6:
-                config.set("num_commands", int(n))
-        elif c == '6':
-            break
-
-def check_update():
-    try:
-        import urllib.request
-        with urllib.request.urlopen(GITHUB_VERSION_URL) as resp:
-            latest = resp.read().decode().strip()
-            if latest > VERSION:
-                print(Fore.GREEN + f"Có phiên bản mới: {latest} (hiện tại: {VERSION})")
-                print("Vui lòng cập nhật từ GitHub repository.")
-            else:
-                print(Fore.GREEN + "Bạn đang dùng phiên bản mới nhất.")
-    except Exception as e:
-        print(Fore.YELLOW + f"Không kiểm tra được cập nhật: {e}")
-
-def main():
-    print_banner()
-    if not check_nmap():
-        print(Fore.RED + "Nmap chưa được cài đặt. Gõ: pkg install nmap")
-        sys.exit(1)
-
-    config = ConfigManager()
-    history = HistoryManager()
-
-    while True:
+def scan_from_file(config):
+    path = input("Đường dẫn file danh sách (mỗi dòng 1 target): ").strip()
+    if not os.path.exists(path):
+        print("File không tồn tại."); return
+    with open(path) as f:
+        targets = [line.strip() for line in f if line.strip()]
+    for t in targets:
         try:
-            choice = show_menu()
-            if choice == '1':
-                scan_target(config, history)
-            elif choice == '2':
-                view_history(history)
-            elif choice == '3':
-                configure(config)
-            elif choice == '4':
-                check_update()
-            elif choice == '5':
-                print(Fore.GREEN + "Tạm biệt!")
-                break
-            else:
-                print(Fore.RED + "Chọn không hợp lệ.")
-        except KeyboardInterrupt:
-            print("\nThoát.")
-            break
-        except Exception as e:
-            print(Fore.RED + f"Lỗi: {e}")
-
-if __name__ == "__main__":
-    main()
+            host = extract_host(t) if not is_valid_host(t) else t
+        except:
+            print(f"Bỏ qua {t}"); continue
+        print(f"\nĐang quét {host}...")
+        api_key = config.get_api_key()
+        advisor = AINmapAdvisor(api_key, config.get("model"))
+        cmds = advisor.suggest_commands(host, "", config.get("num_commands"))
+        scanner = NmapScanner(config.get("timeout"))
+        results = scanner.run_commands(cmds)
+        reporter = ReportGenerator(config.get("output_dir")
